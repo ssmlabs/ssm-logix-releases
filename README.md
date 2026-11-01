@@ -21,4 +21,6 @@ An offline records app for Windows. Beta: keep your paper registers alongside.
 
 Everything stays on your computer. No internet is needed.
 
-Problems? In the app, click Report a problem, then email the saved file to ssmlogix.help@gmail.com.
+## Problems?
+
+In the app, click Report a problem, then email the saved file to ssmlogix.help@gmail.com.
