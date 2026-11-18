@@ -1,0 +1,600 @@
+name: Build SSM Logix demo video & presentation
+
+# Rebuilds SSM_Logix_Demo.mp4 and SSM_Logix_Presentation.pptx from the REAL app.
+# Only public artefacts are used: the SSMLogix.exe on this repository's v1.0-beta
+# release. Nothing from the private source repository is read, written or cloned.
+#
+# 1. unpack the PyInstaller archive of the released build
+# 2. run the real PySide6 UI headless on Linux against a temporary SQLCipher test
+#    company, with an in-memory stand-in for the Windows-only DPAPI key wrapper
+#    (nothing on disk is patched, no application code is edited)
+# 3. capture 1920x1080 screenshots of the real screens
+# 4. narrate with edge-tts and assemble a 1080p/30fps demo video with ffmpeg
+# 5. build the 12-slide deck and embed the video on slide 12
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-demo-presentation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      QT_QPA_PLATFORM: xcb
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb ffmpeg python3-venv python3-pip \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxkbcommon-x11-0 libegl1 libgl1 \
+            libglib2.0-0 libdbus-1-3 libfontconfig1 fonts-dejavu-core
+
+      - name: Python packages
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install "PySide6-Essentials==6.8.*" sqlcipher3-binary pyinstxtractor-ng \
+                      pillow python-pptx edge-tts numpy openpyxl pyyaml cryptography
+
+      - name: Unpack the released application
+        run: |
+          curl -sSL -o SSMLogix.exe \
+            https://github.com/ssmlabs/ssm-logix-releases/releases/download/v1.0-beta/SSMLogix.exe
+          . .venv/bin/activate
+          pyinstxtractor-ng SSMLogix.exe
+          mkdir -p app
+          cp -r SSMLogix.exe_extracted/PYZ.pyz_extracted/ssm_logix app/
+          cp -r SSMLogix.exe_extracted/assets app/
+
+      - name: Write capture scripts
+        run: |
+          mkdir -p build
+          cat > build/shim.py <<'PYEOF'
+          import sys, os
+          ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+          sys.frozen = True
+          sys._MEIPASS = os.path.join(os.getcwd(), 'SSMLogix.exe_extracted')
+          sys.path.insert(0, os.path.join(ROOT, 'app'))
+          from ssm_logix import crypto
+          crypto.dpapi_protect = lambda data: data
+          crypto.dpapi_unprotect = lambda data: data
+          PYEOF
+
+          cat > build/seed.py <<'PYEOF'
+          import shim, shutil, pathlib
+          from ssm_logix import business, crypto, catalog, auth, purchasing, production, counter, bomrun
+
+          shutil.rmtree('books', ignore_errors=True)
+          pathlib.Path('books').mkdir(parents=True, exist_ok=True)
+          books, recovery = business.create_business(
+              'books', 'Sethi Metals & Alloys', '482913', crypto.new_recovery_key(),
+              'Factory', None, 'Rakesh Sethi')
+          db, U, R = books.db, 'Rakesh Sethi', 'Supervisor'
+          auth.sign_in(db, U, '482913')
+          for u in ('kg', 'bag', 'litre', 'pcs'):
+              try:
+                  catalog.add_unit(db, U, u)
+              except Exception:
+                  pass
+          for n, ph in (('Sharma Metals & Co', '98200 41122'),
+                        ('Bharat Scrap Traders', '98110 55321'),
+                        ('Goyal Alloys', '99301 22114')):
+              catalog.add_vendor(db, U, n, ph)
+          for n, ph in (('Anand Traders', '98220 77110'), ('Verma Hardware', '97020 33145')):
+              catalog.add_customer(db, U, n, ph)
+          al = catalog.add_item(db, U, 'Aluminium Ingot', 'kg', None, None, 500, 'Sharma Metals & Co', 245, 1200, 240)
+          cu = catalog.add_item(db, U, 'Copper Wire Scrap', 'kg', 'bag', 25, 200, 'Bharat Scrap Traders', 720, 400, 715)
+          zn = catalog.add_item(db, U, 'Zinc Dross', 'kg', None, None, 150, 'Goyal Alloys', 210, 260, 208)
+          ma = catalog.add_item(db, U, 'Master Alloy', 'kg', None, None, 40, 'Sharma Metals & Co', 410, 90, 405)
+          p1 = catalog.add_product(db, U, 'Alu Ingot 6061 Billet', 'kg', 320)
+          p2 = catalog.add_product(db, U, 'Copper Rod 8mm', 'kg', 785)
+          catalog.add_product(db, U, 'Zinc Anode Plate', 'kg', 268)
+          catalog.set_bom(db, U, p1, [(al, '1.02', 'kg'), (ma, '0.03', 'kg')])
+          catalog.set_bom(db, U, p2, [(cu, '1.05', 'kg')])
+          for vendor, bill, item, qty, rate in (
+                  ('Sharma Metals & Co', 'SM-2291', al, 600, 245),
+                  ('Bharat Scrap Traders', 'BS-1187', cu, 200, 720),
+                  ('Goyal Alloys', 'GA-7742', zn, 180, 210)):
+              pid = purchasing.add_purchase(db, U, R, catalog.find_vendor(db, vendor), bill,
+                                            [{'item_id': item, 'qty': qty, 'unit': 'kg', 'rate': rate}])
+              purchasing.approve_purchase(db, U, R, pid)
+          for prod, made, sold, stock, wasted in (
+                  ('Alu Ingot 6061 Billet', 420, 380, 40, 3),
+                  ('Copper Rod 8mm', 150, 128, 20, 2),
+                  ('Zinc Anode Plate', 96, 88, 8, 1)):
+              production.approve(db, U, R, production.add_row(db, U, R, prod, made, sold, stock, wasted))
+          cart = counter.Cart(db)
+          cart.tap('Alu Ingot 6061 Billet', 12)
+          cart.tap('Zinc Anode Plate', 4)
+          counter.checkout(db, U, R, cart, 'Cash', 'Anand Traders')
+          cart = counter.Cart(db)
+          cart.tap('Copper Rod 8mm', 6)
+          counter.checkout(db, U, R, cart, 'UPI', 'Verma Hardware')
+          iid = purchasing.new_indent(db, U, R, p1, 60, 'Monthly billet batch')
+          purchasing.approve_indent(db, U, R, iid)
+          runs = bomrun.list_runs(db)
+          if runs:
+              bomrun.complete_run(db, U, R, dict(runs[0])['id'], 60, '61.2', '56.4', 'dross loss')
+          books.mark_clean_exit()
+          books.close()
+          print('seeded')
+          PYEOF
+
+          cat > build/shots.py <<'PYEOF'
+          import shim, os, time
+          from PySide6.QtWidgets import QApplication, QPushButton, QPlainTextEdit, QTabBar, QLineEdit
+          from PySide6.QtTest import QTest
+          from PySide6.QtCore import Qt
+          from ssm_logix import business, auth
+          from ssm_logix.ui import main_window as mw, signin as si
+
+          os.makedirs('shots', exist_ok=True)
+          app = QApplication(['SSMLogix'])
+          books = business.open_business(business.list_businesses('books')[0])
+
+          def pump(ms=1000):
+              t = time.time()
+              while time.time() - t < ms / 1000:
+                  app.processEvents()
+                  time.sleep(0.005)
+
+          w = si.SignIn(books.db, 'dark', 15, books)
+          w.resize(1920, 1080)
+          w.show()
+          pump(1500)
+          for d in '482913':
+              QTest.keyClick(w, getattr(Qt, 'Key_' + d))
+              pump(80)
+          pump(200)
+          w.grab().save('shots/signin.png')
+          w.close()
+
+          user = dict(auth.sign_in(books.db, 'Rakesh Sethi', '482913'))
+          ctx = mw.Context(books, app, user['name'], user['role'])
+          win = mw.MainWindow(ctx, False)
+          win.resize(1920, 1080)
+          win.show()
+          pump(1800)
+
+          def btn(page, label):
+              for b in win.pages[page].findChildren(QPushButton):
+                  if b.isVisible() and label in b.text():
+                      return b
+              return None
+
+          for key in ('dashboard', 'items', 'reg_bom', 'receipts', 'counter', 'summary', 'challan', 'multipc'):
+              win.show_page(key, True, False)
+              pump(1100)
+              win.grab().save('shots/%s.png' % key)
+
+          win.show_page('items', True, False)
+          pump(800)
+          tabs = win.pages['items'].findChildren(QTabBar)
+          if tabs:
+              tabs[0].setCurrentIndex(1)
+              pump(900)
+              win.grab().save('shots/items_bom.png')
+
+          win.nav_buttons['counter'].click()
+          pump(1000)
+          for label in ('Alu Ingot 6061 Billet', 'Zinc Anode Plate', 'Copper Rod 8mm'):
+              b = btn('counter', label)
+              if b:
+                  b.click()
+                  pump(420)
+          win.grab().save('shots/counter_cart.png')
+
+          win.nav_buttons['whatsapp'].click()
+          pump(1000)
+          ed = win.pages['whatsapp'].findChildren(QPlainTextEdit)[0]
+          ed.setPlainText(
+              "12/11/2026, 09:12 - Rakesh Sethi: purchase 200 kg aluminium ingot @ 245 from Sharma Metals & Co\n"
+              "12/11/2026, 09:20 - Rakesh Sethi: sale 12 Alu Ingot 6061 Billet to Anand Traders\n"
+              "12/11/2026, 09:26 - Rakesh Sethi: production 420 kg Alu Ingot 6061 Billet made\n"
+              "12/11/2026, 09:40 - Rakesh Sethi: paid 4912 to Sharma Metals & Co for freight\n"
+              "12/11/2026, 09:55 - Rakesh Sethi: issue 200 kg Copper Wire Scrap for billet batch")
+          pump(500)
+          rb = btn('whatsapp', 'Read messages')
+          if rb:
+              rb.click()
+          pump(1600)
+          win.grab().save('shots/whatsapp.png')
+
+          win.show_page('multipc', True, False)
+          pump(1000)
+          fields = win.pages['multipc'].findChildren(QLineEdit)
+          if fields:
+              QTest.keyClicks(fields[0], '482913')
+          pump(300)
+          on = btn('multipc', 'Switch multi-PC on')
+          if on:
+              on.click()
+          pump(2200)
+          new_code = btn('multipc', 'New pairing code')
+          if new_code:
+              new_code.click()
+          pump(1200)
+          win.grab().save('shots/multipc.png')
+
+          books.mark_clean_exit()
+          books.close()
+          print('shots:', sorted(os.listdir('shots')))
+          PYEOF
+
+      - name: Capture the real screens headless
+        run: |
+          . .venv/bin/activate
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python build/seed.py
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python build/shots.py
+          ls -l shots
+
+      - name: Narrate with edge-tts
+        run: |
+          . .venv/bin/activate
+          mkdir -p vo
+          python - <<'PYEOF'
+          import json, subprocess, time, os
+          LINES = [
+              ('01', 'Encrypted sign-in', 'This is SSM Logix, Spreadsheet Smart Matrix Logix. An offline-first operations engine for industrial plants and wholesale traders.', 'signin'),
+              ('02', 'Dashboard', 'Everything starts on your own PC. Pick the supervisor, tap the six digit PIN, and the encrypted books open locally, with no server involved.', 'dashboard'),
+              ('03', 'Counter', "The dashboard shows today's sales, cash received, yield and red flags the moment the day begins.", 'counter_cart'),
+              ('04', 'Receipt', 'At the counter, tap the products and the total builds itself, then prints a clean thermal receipt in one click.', 'receipts'),
+              ('05', 'BOM', 'Every product carries a bill of materials, so approving an indent auto deducts raw material and logs the batch.', 'reg_bom'),
+              ('06', 'WhatsApp', 'Orders from WhatsApp are pasted straight in, and the parser reads items, quantities and rates into purchase lines.', 'whatsapp'),
+              ('07', 'WLAN sync', 'A second PC? Peer to peer sync over local Wi-Fi shares the same encrypted books, without touching the internet.', 'multipc'),
+              ('08', 'Offline', 'No cloud, no monthly fee, no data leaving your premises. That is SSM Logix. Your records, offline.', 'dashboard'),
+          ]
+          out = []
+          for idx, cap, text, shot in LINES:
+              mp3 = 'vo/%s.mp3' % idx
+              for attempt in range(6):
+                  r = subprocess.run(['edge-tts', '--voice', 'en-IN-PrabhatNeural', '--rate=+8%',
+                                      '--text', text, '--write-media', mp3], capture_output=True)
+                  if r.returncode == 0 and os.path.getsize(mp3) > 5000:
+                      break
+                  time.sleep(3)
+              dur = float(subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries',
+                                                   'format=duration', '-of', 'default=nw=1:nk=1', mp3]).strip())
+              out.append({'idx': idx, 'cap': cap, 'text': text, 'shot': shot, 'dur': round(dur, 3), 'mp3': mp3})
+          json.dump(out, open('vo/lines.json', 'w'), indent=1)
+          print('narration', round(sum(o['dur'] for o in out), 2), 's')
+          PYEOF
+
+      - name: Assemble the 1080p demo video
+        run: |
+          . .venv/bin/activate
+          python - <<'PYEOF'
+          import json, subprocess
+          from PIL import Image, ImageDraw, ImageFont
+
+          FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+          def font(sz):
+              try:
+                  return ImageFont.truetype(FONT, sz)
+              except Exception:
+                  return ImageFont.load_default()
+
+          def caption_png(path, title, sub, step_no):
+              im = Image.new('RGBA', (1920, 104), (11, 15, 20, 224))
+              d = ImageDraw.Draw(im)
+              d.rectangle([0, 0, 6, 104], fill=(38, 214, 168, 255))
+              d.text((44, 20), title, font=font(33), fill=(242, 246, 249, 255))
+              d.text((44, 62), sub, font=font(22), fill=(147, 164, 176, 255))
+              label = 'SSM Logix  .  ' + step_no
+              tw = d.textlength(label, font=font(21))
+              d.text((1920 - 44 - tw, 40), label, font=font(21), fill=(38, 214, 168, 255))
+              im.save(path)
+
+          lines = json.load(open('vo/lines.json'))
+          segs, audio = [], []
+          for i, ln in enumerate(lines):
+              dur = ln['dur'] + 0.5
+              cap = 'vo/cap%02d.png' % (i + 1)
+              caption_png(cap, ln['cap'], ln['text'][:94] + ('...' if len(ln['text']) > 94 else ''), ln['idx'])
+              seg = 'vo/seg%02d.mp4' % (i + 1)
+              fc = ("[0:v]scale=2400:-1,"
+                    "zoompan=z='min(zoom+0.00025,1.10)':d=%d:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+                    "s=1920x1080:fps=30[bg];[bg][1:v]overlay=0:976,format=yuv420p" % int(dur * 30))
+              subprocess.run(['ffmpeg', '-y', '-v', 'error', '-loop', '1', '-i', 'shots/%s.png' % ln['shot'],
+                              '-loop', '1', '-i', cap, '-t', '%.3f' % dur, '-filter_complex', fc,
+                              '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-r', '30', seg], check=True)
+              segs.append(seg)
+              wav = 'vo/a%02d.wav' % (i + 1)
+              subprocess.run(['ffmpeg', '-y', '-v', 'error', '-i', ln['mp3'], '-ar', '48000', '-ac', '2',
+                              '-af', 'apad=whole_dur=%.3f,atrim=0:%.3f' % (dur, dur), wav], check=True)
+              audio.append(wav)
+          open('vo/list.txt', 'w').write(''.join("file '%s'\n" % s for s in segs))
+          open('vo/alist.txt', 'w').write(''.join("file '%s'\n" % s for s in audio))
+          subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'concat', '-safe', '0', '-i', 'vo/list.txt',
+                          '-c', 'copy', 'vo/video.mp4'], check=True)
+          subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'concat', '-safe', '0', '-i', 'vo/alist.txt',
+                          '-c', 'copy', 'vo/audio.wav'], check=True)
+          subprocess.run(['ffmpeg', '-y', '-v', 'warning', '-i', 'vo/video.mp4', '-i', 'vo/audio.wav',
+                          '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k', '-shortest',
+                          '-movflags', '+faststart', 'SSM_Logix_Demo.mp4'], check=True)
+          print('video ready')
+          PYEOF
+          ffprobe -v error -show_entries format=duration:stream=width,height,r_frame_rate \
+                  -of default=nw=1 SSM_Logix_Demo.mp4
+
+      - name: Build the 12-slide presentation
+        run: |
+          . .venv/bin/activate
+          mkdir -p deck_assets
+          cp shots/dashboard.png deck_assets/dash.png
+          cp shots/items_bom.png deck_assets/items.png
+          cp shots/reg_bom.png deck_assets/regbom.png
+          cp shots/whatsapp.png deck_assets/whatsapp.png
+          cp shots/multipc.png deck_assets/lan.png
+          cp shots/receipts.png deck_assets/receipts.png
+          cp shots/counter_cart.png deck_assets/counter.png
+          cp app/assets/logo/ssm_logo.png deck_assets/logo.png
+          python - <<'PYEOF'
+          import os
+          from pptx import Presentation
+          from pptx.util import Inches, Pt
+          from pptx.dml.color import RGBColor
+          from pptx.enum.text import PP_ALIGN
+          from pptx.enum.shapes import MSO_SHAPE
+
+          A = lambda n: os.path.join('deck_assets', n)
+          BG = RGBColor(0x0B, 0x0F, 0x14); PANEL = RGBColor(0x13, 0x1A, 0x21)
+          PANEL2 = RGBColor(0x18, 0x21, 0x2A); ACCENT = RGBColor(0x26, 0xD6, 0xA8)
+          TEXT = RGBColor(0xF2, 0xF6, 0xF9); MUTED = RGBColor(0x93, 0xA4, 0xB0)
+          AMBER = RGBColor(0xF2, 0xB2, 0x4C); RED = RGBColor(0xF2, 0x6D, 0x6D)
+          LINE = RGBColor(0x25, 0x31, 0x3C); F = 'Segoe UI'; FS = 'Segoe UI Semibold'
+
+          prs = Presentation(); prs.slide_width = Inches(13.333); prs.slide_height = Inches(7.5)
+          BLANK = prs.slide_layouts[6]
+
+          def bg(s):
+              r = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, prs.slide_height)
+              r.fill.solid(); r.fill.fore_color.rgb = BG; r.line.fill.background(); r.shadow.inherit = False
+
+          def box(s, x, y, w, h, fill=PANEL, line=LINE):
+              r = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+              r.fill.solid(); r.fill.fore_color.rgb = fill
+              if line is None: r.line.fill.background()
+              else: r.line.color.rgb = line; r.line.width = Pt(1)
+              r.shadow.inherit = False
+              try: r.adjustments[0] = 0.08
+              except Exception: pass
+
+          def t(s, x, y, w, h, txt, size=14, colour=TEXT, bold=False, font=F, align=PPARIGN if False else PP_ALIGN.LEFT, spacing=1.15):
+              tb = s.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+              tf = tb.text_frame; tf.word_wrap = True
+              for k, ln in enumerate(txt.split('\n')):
+                  p = tf.paragraphs[0] if k == 0 else tf.add_paragraph()
+                  p.alignment = align; p.line_spacing = spacing; p.space_after = Pt(4)
+                  r = p.add_run(); r.text = ln
+                  r.font.size = Pt(size); r.font.bold = bold; r.font.name = font; r.font.color.rgb = colour
+              return tb
+
+          def head(s, kicker, title, sub=''):
+              bar = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.09))
+              bar.fill.solid(); bar.fill.fore_color.rgb = ACCENT; bar.line.fill.background(); bar.shadow.inherit = False
+              t(s, 0.75, 0.5, 9, 0.3, kicker.upper(), 11, ACCENT, True)
+              t(s, 0.75, 0.9, 11.6, 0.8, title, 26, TEXT, True, FS, spacing=1.0)
+              if sub: t(s, 0.75, 1.7, 11.2, 0.5, sub, 13, MUTED)
+
+          def foot(s, n):
+              ln = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.75), Inches(6.86), Inches(11.83), Pt(0.75))
+              ln.fill.solid(); ln.fill.fore_color.rgb = LINE; ln.line.fill.background(); ln.shadow.inherit = False
+              t(s, 0.75, 7.0, 8, 0.26, 'SSM Logix  .  Spreadsheet Smart Matrix Logix  .  v1.0-beta', 9.5, MUTED)
+              t(s, 11.9, 7.0, 0.7, 0.26, str(n), 9.5, MUTED, align=PP_ALIGN.RIGHT)
+
+          def note(s, txt): s.notes_slide.notes_text_frame.text = txt
+
+          def pic(s, path, x, y, w, h):
+              box(s, x - 0.04, y - 0.04, w + 0.08, h + 0.08, PANEL2)
+              s.shapes.add_picture(path, Inches(x), Inches(y), Inches(w), Inches(h))
+
+          def card(s, x, y, w, h, glyph, title, body, accent=ACCENT, size=11):
+              box(s, x, y, w, h)
+              bar = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(0.055), Inches(h))
+              bar.fill.solid(); bar.fill.fore_color.rgb = accent; bar.line.fill.background(); bar.shadow.inherit = False
+              t(s, x + 0.3, y + 0.2, 0.6, 0.4, glyph, 18, accent, True)
+              t(s, x + 0.3, y + 0.68, w - 0.6, 0.4, title, 13.5, TEXT, True, FS)
+              t(s, x + 0.3, y + 1.08, w - 0.6, h - 1.25, body, size, MUTED)
+
+          s = prs.slides.add_slide(BLANK); bg(s)
+          s.shapes.add_picture(A('logo.png'), Inches(0.75), Inches(1.05), Inches(4.1), height=Inches(1.36))
+          t(s, 0.75, 2.72, 10.5, 0.82, 'SSM Logix', 40, TEXT, True, FS)
+          t(s, 0.75, 3.58, 10.5, 0.45, 'Spreadsheet Smart Matrix Logix', 16, ACCENT, True)
+          t(s, 0.75, 4.3, 9.9, 0.6, 'Offline-First Industrial & Trade Operations Engine', 20, TEXT)
+          t(s, 0.75, 5.05, 6.6, 1.1, 'Inventory, production, cash and dispatch, running entirely inside your own building on an encrypted local database. No internet. No cloud account.', 12.5, MUTED, spacing=1.3)
+          for i, (k, v) in enumerate((('100% offline', 'runs with the network unplugged'),
+                                      ('SQLCipher', 'encrypted local books'),
+                                      ('Zero cloud', 'no server, no monthly bill'))):
+              yy = 2.55 + i * 0.86
+              box(s, 7.55, yy, 4.95, 0.72)
+              t(s, 7.8, yy + 0.12, 1.9, 0.3, k, 12.5, ACCENT, True)
+              t(s, 9.55, yy + 0.14, 2.8, 0.3, v, 10.5, MUTED)
+          foot(s, 1)
+          note(s, 'SSM Logix is an offline-first operations engine for industrial processing units, wholesale traders and distributors. Everything the business records each day lives in one encrypted file on the owners own PC. This deck covers the problem, the product, the architecture from the shipping codebase, the market, the deployment model, the roadmap and a recorded demo of the real application.')
+
+          s = prs.slides.add_slide(BLANK); bg(s)
+          head(s, 'The problem', 'Paper still runs the floor, even with a live ERP',
+               'Wholesale traders and processing plants lose hours every day to gaps no cloud product closes.')
+          card(s, 0.75, 2.15, 5.85, 1.95, '!', 'Internet decides whether the business works', 'Cloud ERPs stop at the counter the moment the line drops. Weighbridge, dispatch and cash sales wait for the router.', RED)
+          card(s, 6.85, 2.15, 5.85, 1.95, '!', 'Data leaves the premises by design', 'Masters, rates, vendor ledgers and margins sit on somebody elses server, a commercial and compliance risk.', RED)
+          card(s, 0.75, 4.25, 5.85, 1.95, '!', 'Manual registers are slow and drift', 'One register per clerk, totals by hand, stock written twice. Month end becomes a reconciliation exercise.', AMBER)
+          card(s, 6.85, 4.25, 5.85, 1.95, '!', 'Stock never matches the shelf', 'Material issued to a batch is not deducted until someone remembers, so the book and the shelf disagree every week.', AMBER)
+          foot(s, 2)
+          note(s, 'Four pain points from processing plants, wholesale traders and vendors: connectivity that stops billing, data that leaves the premises, manual registers that drift, and stock that never matches because BOM deduction depends on memory. Each one costs money before the owner notices.')
+
+          s = prs.slides.add_slide(BLANK); bg(s)
+          head(s, 'The solution', 'The same discipline as a cloud ERP, executed locally',
+               'One encrypted database, one desktop engine, and a UI built for a clerk with one free hand.')
+          card(s, 0.75, 2.2, 3.75, 2.5, '1', '100% offline execution', 'Registers, counter, BOM, cash book and reports all run on the PC. Unplug the network and every screen still works.')
+          card(s, 4.75, 2.2, 3.75, 2.5, '2', 'SQLCipher local encryption', 'The books file is a SQLCipher database, key wrapped per PC, recoverable only with the printed recovery key.')
+          card(s, 8.75, 2.2, 3.85, 2.5, '3', 'Zero cloud dependency', 'No tenant, no account, no background upload. Backups are files on a pen drive and updates are a deliberate click.')
+          box(s, 0.75, 4.95, 11.85, 1.5, PANEL2)
+          t(s, 1.05, 5.15, 11.3, 1.1, 'Entries that took minutes now take seconds, because the counter, the registers and the stock folio read the same numbers. Nothing is retyped, nothing waits for a server, and the day closes with a printed summary instead of a guess.', 12, TEXT, spacing=1.3)
+          foot(s, 3)
+          note(s, 'Keep the discipline of an ERP, one source of truth, validation, audit trail and approvals, and execute it locally. Storage is a real encrypted SQLite database, not a protected folder. There is no tenant and no telemetry, so nothing can leak a rate sheet.')
+
+          s = prs.slides.add_slide(BLANK); bg(s)
+          head(s, 'Target audience', 'Who buys it, and what their day looks like',
+               'Owner operated operations with one to three PCs and no IT staff on site.')
+          for i, (hh, bb) in enumerate((('Processing units', 'Metal, plastic, food and agro units converting raw material into batches: BOM, yield, wastage and production and sales in one place.'),
+                                        ('Wholesale traders', 'Counter sales plus credit parties, rate changes through the day, and a cash book that must reconcile before the shutter closes.'),
+                                        ('Distributors and vendors', 'Purchase bills, delivery challans, returns, and stock that follows the vehicle out of the gate.'),
+                                        ('Owners and management', 'One supervisor PIN that approves, one dashboard for today, and a printable summary for the accountant.'))):
+              card(s, 0.75 + (i % 2) * 6.1, 2.15 + (i // 2) * 2.05, 5.75, 1.85, '>', hh, bb)
+          foot(s, 4)
+          note(s, 'Processing units care about the batch, traders about the counter and the cash book, distributors about movement documents, and owners about one screen and one printed summary. Typical install is one to three PCs with two to six named users.')
+
+          s = prs.slides.add_slide(BLANK); bg(s)
+          head(s, 'System architecture and security', 'A desktop engine, an encrypted file, no open door',
+               'From the shipping v1.0-beta build: PySide6 desktop UI over a SQLCipher database.')
+          for i, (hh, bb, c) in enumerate((('Desktop application', 'PySide6 (Qt 6) UI, 31 screens, Supervisor / Operator / Auditor roles', ACCENT),
+                                          ('Local business engine', 'Registers, stock, purchasing, production, BOM runs, cash book, receipts, LAN sync', ACCENT),
+                                          ('Encrypted books (SQLCipher)', 'books.db, encrypted pages, per-PC key wrap, printed recovery key', AMBER))):
+              yy = 2.12 + i * 1.18
+              box(s, 0.75, yy, 7.35, 1.02)
+              t(s, 1.05, yy + 0.16, 6.9, 0.3, hh, 13.5, TEXT, True, FS)
+              t(s, 1.05, yy + 0.5, 6.9, 0.4, bb, 10.5, MUTED)
+          for i, (hh, bb) in enumerate((('PIN and role access', '6-digit PIN hashed with scrypt, five wrong tries lock for five minutes.'),
+                                        ('Per-PC key wrap', 'Key protected on this machine, recovery key is the only escape hatch.'),
+                                        ('Audit trail', 'Every approval, correction and deletion with user, time and reason.'),
+                                        ('Zero external exposure', 'No inbound cloud service, no telemetry, no background upload.'))):
+              yy = 2.12 + i * 1.05
+              box(s, 8.45, yy, 4.15, 0.95, PANEL2)
+              t(s, 8.7, yy + 0.12, 3.7, 0.26, hh, 11.5, ACCENT, True)
+              t(s, 8.7, yy + 0.42, 3.7, 0.45, bb, 9.4, MUTED)
+          foot(s, 5)
+          note(s, 'Architecture as shipped: PySide6 over a local Python engine writing one SQLCipher database per business. Roles are Supervisor, Operator and Auditor. PINs are scrypt hashes with a five try lockout. The database key is wrapped per PC and moved only with the printed recovery key, and every approval or correction is audited.')
+
+          s = prs.slides.add_slide(BLANK); bg(s)
+          head(s, 'Key features, part 1', 'Smart matrix, automatic deduction, chat orders',
+               'The three features that remove the most typing per day.')
+          for i, (tag, title, bullets, img) in enumerate((('Smart matrix inventory', 'One item master, many units', ['Stock unit, bought unit and conversion', 'Weighted average cost and reorder level', 'Stock folio with register references', 'Deficits flagged until the purchase lands'], 'items.png'),
+                                                          ('BOM auto-deduction', 'A batch eats its recipe', ['Bill of materials per product', 'Indent approval issues stock', 'Yield recorded against normal', 'Yield drop raises its own flag'], 'regbom.png'),
+                                                          ('WhatsApp order parsing', 'The chat becomes the line', ['Items, quantity, unit and rate read', 'Names matched to masters', 'Unclear lines marked needs you', 'Supervisor confirms before posting'], 'whatsapp.png'))):
+              x = 0.75 + i * 4.0
+              box(s, x, 2.1, 3.85, 4.05)
+              t(s, x + 0.3, 2.3, 3.2, 0.26, tag.upper(), 9.3, ACCENT, True)
+              t(s, x + 0.3, 2.58, 3.2, 0.6, title, 14, TEXT, True, FS, spacing=1.05)
+              t(s, x + 0.3, 3.25, 3.2, 1.4, '\n'.join('- ' + b for b in bullets), 9.8, MUTED)
+              pic(s, A(img), x + 0.3, 4.7, 3.25, 1.3)
+          foot(s, 6)
+          note(s, 'The smart matrix keeps one item master with stock and bought units, conversions, weighted average cost and reorder levels. BOM auto-deduction issues materials when an indent is approved and opens a batch run with yield tracking. The WhatsApp reader turns pasted chat into candidate purchase, sale, payment and issue lines that a supervisor confirms.')
+
+          s = prs.slides.add_slide(BLANK); bg(s)
+          head(s, 'Key features, part 2', 'Two PCs, no server, and paper in the customers hand',
+               'Connectivity and output, both local.')
+          for i, (tag, title, bullets, img) in enumerate((('Peer-to-peer local WLAN sync', 'Multi-PC over the office router', ['Supervisor enables it with the PIN', 'One time pairing code, ten minutes', 'Books stay on one machine', 'Switch off and pairings are forgotten'], 'lan.png'),
+                                                          ('Thermal slip and dispatch challan', 'Print at the counter, or save a PDF', ['42 column thermal receipt', 'Duplicate reprint, audited', 'Challan with quantities and signature', 'Daily summary as PDF'], 'receipts.png'))):
+              x = 0.75 + i * 6.1
+              box(s, x, 2.1, 5.85, 4.2)
+              t(s, x + 0.3, 2.3, 5.2, 0.26, tag.upper(), 9.3, ACCENT, True)
+              t(s, x + 0.3, 2.58, 5.2, 0.5, title, 14, TEXT, True, FS)
+              t(s, x + 0.3, 3.15, 5.25, 1.35, '\n'.join('- ' + b for b in bullets), 9.8, MUTED)
+              pic(s, A(img), x + 0.3, 4.55, 5.25, 1.55)
+          foot(s, 7)
+          note(s, 'Multi-PC is peer to peer over the office router: the supervisor enables it with the PIN and a one time code pairs the second PC. Output is physical: a 42 column thermal slip, audited duplicate reprints, a delivery challan with no prices, and a daily summary as PDF.')
+
+          s = prs.slides.add_slide(BLANK); bg(s)
+          head(s, 'How it works', 'Three steps from install to a closed day',
+               'The user journey a new clerk learns in one sitting.')
+          for i, (n, hh, bb, img) in enumerate((('01', 'Install and sign in', 'Name the business, set a 6-digit supervisor PIN, keep the recovery key. Later: pick your name, tap the PIN.', 'counter.png'),
+                                                ('02', 'Log the day', 'Purchases, production and counter sales. BOM deducts material, and pasted chat becomes lines waiting for approval.', 'regbom.png'),
+                                                ('03', 'Print and sync', 'Print the receipt or challan, let a second PC work over the WLAN, close the day into a PDF summary.', 'lan.png'))):
+              x = 0.75 + i * 4.0
+              box(s, x, 2.1, 3.7, 4.2)
+              t(s, x + 0.3, 2.24, 1.0, 0.5, n, 26, ACCENT, True, FS)
+              t(s, x + 0.3, 2.84, 3.1, 0.34, hh, 14, TEXT, True, FS)
+              t(s, x + 0.3, 3.24, 3.1, 1.4, bb, 9.6, MUTED)
+              pic(s, A(img), x + 0.3, 4.75, 3.1, 1.35)
+          foot(s, 8)
+          note(s, 'Install is a single executable. First launch asks for the books folder, business name, supervisor PIN and prints a recovery key. Daily use is name plus PIN, then the registers. The day ends with a printed or PDF summary for the accountant.')
+
+          s = prs.slides.add_slide(BLANK); bg(s)
+          head(s, 'Market and competitors', 'Where SSM Logix sits against the two alternatives',
+               'Compared on what a plant actually experiences.')
+          rows = [('Offline reliability', 'Full, every screen works offline', 'Offline, but no validation or totals', 'Stops when the line drops'),
+                  ('Data privacy', 'Encrypted file on your own PC', 'Paper anyone can read', 'Rates on a third party server'),
+                  ('WLAN sync', 'Peer to peer pairing, no server', 'None, books are carried', 'Cloud sync, LAN sites need setup'),
+                  ('BOM automation', 'Recipe, auto deduct, yield flags', 'Manual, in a second sheet', 'Available, needs a consultant'),
+                  ('Recurring cost', 'None. One time site licence', 'Cost of time and errors', 'Per user, per month, forever')]
+          widths = [2.55, 3.45, 2.95, 2.9]
+          cx = 0.75
+          for i, c in enumerate(('', 'SSM Logix', 'Paper / Excel', 'Cloud only ERP')):
+              box(s, cx, 2.15, widths[i], 0.5, ACCENT if i == 1 else PANEL2, None)
+              t(s, cx + 0.16, 2.27, widths[i] - 0.3, 0.3, c, 10.5, BG if i == 1 else TEXT, True, FS)
+              cx += widths[i]
+          for r, row in enumerate(rows):
+              yy = 2.65 + r * 0.84
+              cx = 0.75
+              for i, cell in enumerate(row):
+                  box(s, cx, yy, widths[i], 0.84, PANEL if i != 1 else RGBColor(0x0F, 0x2A, 0x25), None)
+                  t(s, cx + 0.16, yy + (0.28 if i == 0 else 0.13), widths[i] - 0.3, 0.62, cell,
+                    10.2 if i == 0 else 9.0, TEXT if i in (0, 1) else MUTED, i == 0)
+                  cx += widths[i]
+          foot(s, 9)
+          note(s, 'Against paper and Excel, SSM Logix keeps the offline virtue and adds validation, running stock, BOM and an audit trail. Against a cloud ERP it gives up breadth and wins on availability, privacy, latency and recurring cost, which is the objection that kills cloud deals in this market.')
+
+          s = prs.slides.add_slide(BLANK); bg(s)
+          head(s, 'Business and deployment model', 'Sold like equipment, not rented like software',
+               'A model that fits a buyer with no IT staff and no appetite for a monthly bill.')
+          card(s, 0.75, 2.1, 3.8, 2.05, 'Rs', 'Enterprise site licence', 'One time licence per site with optional annual support. No per user seats.')
+          card(s, 4.78, 2.1, 3.8, 2.05, '2', 'Custom plant setup', 'Item master, BOM recipes, headings and printer configured on site, plus training.')
+          card(s, 8.8, 2.1, 3.8, 2.05, '0', 'Zero cloud overhead', 'No servers, no hosting cost, no bandwidth. High margin, lower price than a subscription.')
+          box(s, 0.75, 4.42, 11.85, 2.0, PANEL2)
+          t(s, 1.05, 4.62, 11.3, 1.6, '- Owner operators prefer capex to subscriptions\n- Printer and hardware setup is a natural paid service\n- Annual support renews on trust, not lock in\n- Reference installs in one cluster sell the next five', 11, TEXT, spacing=1.3)
+          foot(s, 10)
+          note(s, 'Charge once per site with optional annual support, and sell the setup work: item master, BOM, printer configuration and training. No hosting cost keeps small sites profitable and the price below a cloud subscription.')
+
+          s = prs.slides.add_slide(BLANK); bg(s)
+          head(s, 'Roadmap', 'From validated beta to a mobile view for the owner',
+               'Fix what real sites break before adding surface area.')
+          for i, (q, hh, bb) in enumerate((('Q4 2026', 'Release validation', 'v1.0-beta in live plants, with daily close, backup and restore rehearsed on real books.'),
+                                          ('Q1 2027', 'Feedback and bug fix sprints', 'Two week cycles on printing quirks, register headings and speed on large books.'),
+                                          ('Q2 2027', 'Barcode and QR batch labels', 'Scan at the counter and dispatch, with labels carrying product, batch and date.'),
+                                          ('Q3 2027', 'Mobile companion viewer', 'Read only phone view for approvals and daily numbers over the local WLAN.'))):
+              x = 0.75 + i * 3.05
+              box(s, x, 1.95, 2.85, 1.2)
+              t(s, x + 0.22, 2.06, 2.4, 0.26, q, 10.5, AMBER if i == 0 else ACCENT, True)
+              t(s, x + 0.22, 2.36, 2.45, 0.7, hh, 11, TEXT, True, FS, spacing=1.05)
+              t(s, x, 3.3, 2.85, 1.9, bb, 9.6, MUTED)
+          foot(s, 11)
+          note(s, 'Validation first, then two week bug fix sprints driven by real sites, then barcode and QR batch labels, then a read only mobile viewer over the local WLAN. No roadmap item may make the desktop app depend on the internet.')
+
+          s = prs.slides.add_slide(BLANK); bg(s)
+          head(s, 'Live working demo', 'The real application, recorded on a test company',
+               'Encrypted sample books, real screens, real clicks.')
+          s.shapes.add_movie('SSM_Logix_Demo.mp4', Inches(0.75), Inches(2.05), Inches(8.55), Inches(4.81),
+                             poster_frame_image=A('dash.png'), mime_type='video/mp4')
+          box(s, 9.6, 2.05, 3.0, 4.81)
+          t(s, 9.85, 2.25, 2.55, 0.3, 'WHAT YOU WILL SEE', 9.8, ACCENT, True)
+          t(s, 9.85, 2.62, 2.6, 2.6, '\n'.join('- ' + i for i in ('Encrypted PIN sign-in', 'Dashboard: sales, cash, yield', 'Counter sale and thermal slip', 'Items, products and BOM', 'WhatsApp chat parsing', 'Multi-PC pairing code', 'Offline by design')), 9.8, TEXT, spacing=1.2)
+          foot(s, 12)
+          note(s, 'The demo plays the real build: encrypted sign in, dashboard, counter and thermal receipt, items and BOM, the WhatsApp parser, and Multi-PC issuing a live one time pairing code. The only Linux adaptation is an in memory stand in for the Windows key wrapper, and the application itself is unmodified.')
+
+          prs.core_properties.title = 'SSM Logix, Spreadsheet Smart Matrix Logix'
+          prs.core_properties.author = 'SSM Logix'
+          prs.save('SSM_Logix_Presentation.pptx')
+          print('deck written')
+          PYEOF
+          ls -l SSM_Logix_Demo.mp4 SSM_Logix_Presentation.pptx
+
+      - name: Commit the artefacts to the repository root
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add SSM_Logix_Demo.mp4 SSM_Logix_Presentation.pptx
+          git diff --cached --quiet || git commit -m 'Rebuild demo video and presentation from the v1.0-beta release'
+          git push
